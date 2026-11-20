@@ -34,8 +34,58 @@ CA_KEYWORDS = [
     "scheme", "திட்டம்", "योजना", "summit", "மாநாடு", "सम्मेलन",
     "award", "விருது", "पुरस्कार", "appointment", "நியமனம்", "नियुक्ति",
     "index", "குறியீடு", "सूचकांक", "budget", "பட்ஜெட்", "बजट",
-    "करेंट अफेयर्स", "समसामयिकी", "sollunga", "pannunga", "kudunga"
+    "करेंट अफेयर्स", "समसामयिकी", "sollunga", "pannunga", "kudunga", "nigalvugal"
 ]
+
+TANGLISH_MARKERS = {
+    "sollunga", "pannunga", "kudunga", "vanakkam", "epdi", "eppadi", "enna",
+    "yaaru", "yaru", "theriyuma", "venum", "irukku", "iruku", "nigalvugal",
+    "nadappu", "pathil", "kelvi", "padippu", "thervu", "matrum", "illa", "tha", "thaan"
+}
+
+
+def detect_response_language(student_q: str) -> str:
+    # Tamil (U+0B80..U+0BFF)
+    if re.search(r"[\u0B80-\u0BFF]", student_q):
+        return "Tamil (in Tamil script only)"
+
+    # Devanagari / Hindi / Marathi (U+0900..U+097F)
+    if re.search(r"[\u0900-\u097F]", student_q):
+        return "Hindi (in Devanagari script only)"
+
+    # Telugu (U+0C00..U+0C7F)
+    if re.search(r"[\u0C00-\u0C7F]", student_q):
+        return "Telugu (in Telugu script only)"
+
+    # Malayalam (U+0D00..U+0D7F)
+    if re.search(r"[\u0D00-\u0D7F]", student_q):
+        return "Malayalam (in Malayalam script only)"
+
+    # Kannada (U+0C80..U+0CFF)
+    if re.search(r"[\u0C80-\u0CFF]", student_q):
+        return "Kannada (in Kannada script only)"
+
+    # Bengali / Assamese (U+0980..U+09FF)
+    if re.search(r"[\u0980-\u09FF]", student_q):
+        return "Bengali (in Bengali script only)"
+
+    # Gujarati (U+0A80..U+0AFF)
+    if re.search(r"[\u0A80-\u0AFF]", student_q):
+        return "Gujarati (in Gujarati script only)"
+
+    # Gurmukhi / Punjabi (U+0A00..U+0A7F)
+    if re.search(r"[\u0A00-\u0A7F]", student_q):
+        return "Punjabi (in Gurmukhi script only)"
+
+    # Odia (U+0B00..U+0B7F)
+    if re.search(r"[\u0B00-\u0B7F]", student_q):
+        return "Odia (in Odia script only)"
+
+    words = set(re.findall(r"[a-zA-Z]+", student_q.lower()))
+    if words & TANGLISH_MARKERS:
+        return "Tanglish (Tamil words written in English letters, matching the user's Tanglish style)"
+
+    return "Pure English (standard English only; do NOT use Tanglish)"
 
 
 def is_current_affairs_query(student_q: str) -> bool:
@@ -62,6 +112,7 @@ def call_gemini(prompt: str, max_output_tokens: int = 1200) -> str:
                     return parts[0]["text"].strip()
             print("GEMINI_ERROR:", data, flush=True)
             err_code = data.get("error", {}).get("code")
+            # Retry only on transient 503; do not retry on 429 quota exhaustion
             if err_code == 503 and attempt < 1:
                 time.sleep(2)
                 continue
@@ -128,10 +179,11 @@ def search_tavily(student_q: str, today_str: str) -> str:
 
 def generate_karka_answer(student_q: str, search_context: str, today_str: str) -> str:
     ca_mode = is_current_affairs_query(student_q)
+    target_lang = detect_response_language(student_q)
 
     if ca_mode:
         length_rule = (
-            "1. Length & Depth: For current affairs queries, provide a comprehensive, exam-focused compilation up to 3000 words when verified facts support it, without fluff or filler. Keep total Telegram output well within safe limits (under 3800 characters per message)."
+            "1. Length & Depth: For current affairs queries, provide a comprehensive, exam-focused compilation up to 3000 words when verified facts support it, without fluff or filler."
         )
         order_rule = (
             "4. Current Affairs Order & Structure: ALWAYS organize current affairs strictly in this exact order:\n"
@@ -140,7 +192,7 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
             "   Third: Tamil Nadu Current Affairs\n"
             "   Use ONLY verified facts from the search results. Clearly note if a specific section or month has limited/unavailable verified data in the results rather than inventing facts."
         )
-        max_tokens = 3500
+        max_tokens = 3800
     else:
         length_rule = (
             "1. Length: Keep the response concise (ideally 120 to 240 words) for Telegram."
@@ -150,20 +202,12 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
         )
         max_tokens = 900
 
-    language_rule = (
-        "Language Rule (CRITICAL): Detect the student's language and script/style carefully and reply in that EXACT SAME language:\n"
-        "- If the student writes in Tamil script, reply in clear exam-oriented Tamil.\n"
-        "- If the student writes in Hindi (Devanagari script), reply in clear exam-oriented Hindi.\n"
-        "- If the student writes in Tanglish (Tamil words written in English letters, like 'sollunga', 'pannunga', 'kudunga', 'vanakkam', 'epdi', 'nadappu nigalvugal'), reply in natural Tanglish (Tamil written in Latin script), not pure English.\n"
-        "- If the student writes in standard English, reply in clear exam-oriented English.\n"
-        "- If another Indian regional language is used, reply in that language as clearly as possible while keeping Rule 0 intact."
-    )
-
     prompt = (
         "Rule 0 (Identity - NEVER CHANGE): The very first line of every response MUST be written in English with exact spelling:\n"
         "Karka AI by Pranila Infotech.\n"
         'Never translate "Karka" into "Karnataka" or any other word.\n\n'
-        f"{language_rule}\n"
+        f"Target Language (MANDATORY): Write the entire response body (after line 1) in {target_lang}. "
+        "Do not switch to another language.\n"
         "Give clear, accurate, and exam-oriented answers tailored for UPSC, TNPSC, and TNUSRB exams.\n\n"
         "Strict Rules:\n"
         f"{length_rule}\n"
@@ -177,7 +221,7 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
         f"Verified Online Search Results:\n{search_context}"
     )
     reply = call_gemini(prompt, max_output_tokens=max_tokens)
-    return reply[:3800] if reply else "Karka AI by Pranila Infotech.\nதற்போது பதிலை உருவாக்க முடியவில்லை, மீண்டும் முயற்சிக்கவும்."
+    return reply if reply else "Karka AI by Pranila Infotech.\nதற்போது பதிலை உருவாக்க முடியவில்லை, மீண்டும் முயற்சிக்கவும்."
 
 
 def send_telegram(chat_id: int, text: str):
