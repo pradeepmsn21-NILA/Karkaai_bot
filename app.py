@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import datetime
 import requests
@@ -13,17 +14,50 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
+MONTH_MAP = {
+    "january": "January", "jan": "January", "ஜனவரி": "January",
+    "february": "February", "feb": "February", "பிப்ரவரி": "February",
+    "march": "March", "mar": "March", "மார்ச்": "March",
+    "april": "April", "apr": "April", "ஏப்ரல்": "April",
+    "may": "May", "மே": "May",
+    "june": "June", "jun": "June", "ஜூன்": "June",
+    "july": "July", "jul": "July", "ஜூலை": "July",
+    "august": "August", "aug": "August", "ஆகஸ்ட்": "August",
+    "september": "September", "sep": "September", "sept": "September", "செப்டம்பர்": "September",
+    "october": "October", "oct": "October", "அக்டோபர்": "October",
+    "november": "November", "nov": "November", "நவம்பர்": "November",
+    "december": "December", "dec": "December", "டிசம்பர்": "December",
+}
 
-def call_gemini(prompt: str) -> str:
+CA_KEYWORDS = [
+    "current affairs", "ca", "நடப்பு நிகழ்வுகள்", "நடப்பு", "news",
+    "scheme", "திட்டம்", "summit", "மாநாடு", "award", "விருது",
+    "appointment", "நியமனம்", "index", "குறியீடு", "budget", "பட்ஜெட்"
+]
+
+
+def is_current_affairs_query(student_q: str) -> bool:
+    q_lower = student_q.lower()
+    has_month = any(k in q_lower for k in MONTH_MAP)
+    has_ca = any(k in q_lower for k in CA_KEYWORDS)
+    return has_month or has_ca
+
+
+def call_gemini(prompt: str, max_output_tokens: int = 1200) -> str:
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_output_tokens,
+        },
     }
     for attempt in range(2):
         try:
-            res = requests.post(GEMINI_URL, json=payload, timeout=30)
+            res = requests.post(GEMINI_URL, json=payload, timeout=45)
             data = res.json()
             if "candidates" in data:
-                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                parts = data["candidates"][0].get("content", {}).get("parts", [])
+                if parts and "text" in parts[0]:
+                    return parts[0]["text"].strip()
             print("GEMINI_ERROR:", data, flush=True)
             err_code = data.get("error", {}).get("code")
             if err_code == 503 and attempt < 1:
@@ -39,19 +73,42 @@ def call_gemini(prompt: str) -> str:
     return ""
 
 
-def search_tavily(query: str, today_str: str) -> str:
-    search_query = f"{query} UPSC TNPSC current affairs India Tamil Nadu {today_str[:4]}"
+def build_search_query(student_q: str, today_str: str) -> tuple[str, str, int]:
+    q_lower = student_q.lower()
+    default_year = today_str[:4]
+
+    year_match = re.search(r"\b(202[4-9]|2030)\b", q_lower)
+    year = year_match.group(1) if year_match else default_year
+
+    detected_month = ""
+    for key, eng_month in MONTH_MAP.items():
+        if key in q_lower:
+            detected_month = eng_month
+            break
+
+    if is_current_affairs_query(student_q):
+        month_part = f"{detected_month} " if detected_month else ""
+        query = f"{month_part}{year} world international national India Tamil Nadu current affairs PIB schemes awards summits UPSC TNPSC"
+        return query, "advanced", 8
+
+    clean_q = re.sub(r"[^\w\s]", " ", student_q).strip()
+    query = f"{clean_q} UPSC TNPSC TNUSRB India Tamil Nadu {default_year}"
+    return query, "basic", 5
+
+
+def search_tavily(student_q: str, today_str: str) -> str:
+    search_query, depth, max_results = build_search_query(student_q, today_str)
     try:
         res = requests.post(
             "https://api.tavily.com/search",
             json={
                 "api_key": TAVILY_API_KEY,
                 "query": search_query,
-                "search_depth": "basic",
-                "max_results": 5,
+                "search_depth": depth,
+                "max_results": max_results,
                 "include_answer": True,
             },
-            timeout=20,
+            timeout=25,
         )
         data = res.json()
         if "results" not in data and "answer" not in data:
@@ -61,41 +118,67 @@ def search_tavily(query: str, today_str: str) -> str:
         snippets = "\n\n".join(
             [f"- {r.get('title', '')}: {r.get('content', '')}" for r in results if r.get("content")]
         )
-        return f"Summary: {answer}\n\nDetailed Results:\n{snippets}"
+        return f"Search Query Used: {search_query}\nSummary: {answer}\n\nDetailed Results:\n{snippets}"
     except Exception as e:
         print("TAVILY_EXCEPTION:", str(e), flush=True)
         return "No search results available."
 
 
 def generate_karka_answer(student_q: str, search_context: str, today_str: str) -> str:
+    ca_mode = is_current_affairs_query(student_q)
+
+    if ca_mode:
+        length_rule = (
+            "1. Length & Depth: For current affairs queries, provide a comprehensive, exam-focused compilation up to 3000 words when verified facts support it, without fluff or filler. Keep total Telegram output well within safe limits (under 3800 characters per message)."
+        )
+        order_rule = (
+            "4. Current Affairs Order & Structure: ALWAYS organize current affairs strictly in this exact order:\n"
+            "   First: Worldwide / International Current Affairs\n"
+            "   Second: National (India) Current Affairs\n"
+            "   Third: Tamil Nadu Current Affairs\n"
+            "   Use ONLY verified facts from the search results. Clearly note if a specific section or month has limited/unavailable verified data in the results rather than inventing facts."
+        )
+        max_tokens = 3500
+    else:
+        length_rule = (
+            "1. Length: Keep the response concise (ideally 120 to 240 words) for Telegram."
+        )
+        order_rule = (
+            "4. Current Affairs & Live Data: Use ONLY verified facts from the provided search results when answering current/live questions."
+        )
+        max_tokens = 900
+
     prompt = (
         "Rule 0 (Identity - NEVER CHANGE): The very first line of every response MUST be written in English with exact spelling:\n"
         "Karka AI by Pranila Infotech.\n"
         'Never translate "Karka" into "Karnataka" or any other word.\n\n'
         "Reply in the exact same language the student uses (Tamil, English, or Tanglish). Give clear, accurate, and exam-oriented answers tailored for UPSC, TNPSC, and TNUSRB exams.\n\n"
         "Strict Rules:\n"
-        "1. Length: Keep the response concise (ideally 120 to 220 words, strictly under 3000 characters) for Telegram.\n"
+        f"{length_rule}\n"
         "2. Formatting: Never use asterisks (*) or markdown bold/italics. Use clean plain text, hyphen bullet points (-), and relevant emojis only.\n"
         "3. No Coaching/Academy Names: NEVER mention, recommend, or promote any coaching institute, IAS/TNPSC academy, website, or third-party brand name in the answer. Present only direct exam facts.\n"
-        "4. Current Affairs & Live Data: Use ONLY the verified facts from the provided search results. For monthly current affairs, summarize concrete events, schemes, summits, indices, appointments, awards, or policy updates found in the search results-do not just list calendar days unless asked specifically for important days. If concrete current affairs facts for that specific month/topic are missing in the search results, clearly state that verified live data for that query is currently unavailable rather than making up filler points.\n"
+        f"{order_rule}\n"
         "5. Ambiguous/Misleading Queries: Clearly separate facts and clarify actual constitutional/official positions without guessing.\n"
         "6. Safety: Strictly refuse sexually explicit content, inappropriate queries, or illegal activities.\n\n"
         f"Today's Date: {today_str}\n"
         f"Student's Question: {student_q}\n\n"
         f"Verified Online Search Results:\n{search_context}"
     )
-    reply = call_gemini(prompt)
-    return reply[:2900] if reply else "Karka AI by Pranila Infotech.\nதற்போது பதிலை உருவாக்க முடியவில்லை, மீண்டும் முயற்சிக்கவும்."
+    reply = call_gemini(prompt, max_output_tokens=max_tokens)
+    return reply[:3800] if reply else "Karka AI by Pranila Infotech.\nதற்போது பதிலை உருவாக்க முடியவில்லை, மீண்டும் முயற்சிக்கவும்."
 
 
 def send_telegram(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        res = requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=15)
-        if not res.ok:
-            print("TELEGRAM_ERROR:", res.text, flush=True)
-    except Exception as e:
-        print("TELEGRAM_EXCEPTION:", str(e), flush=True)
+    # Telegram sendMessage max limit is 4096 characters; split cleanly if needed
+    chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
+    for chunk in chunks:
+        try:
+            res = requests.post(url, json={"chat_id": chat_id, "text": chunk}, timeout=20)
+            if not res.ok:
+                print("TELEGRAM_ERROR:", res.text, flush=True)
+        except Exception as e:
+            print("TELEGRAM_EXCEPTION:", str(e), flush=True)
 
 
 @app.route("/", methods=["GET"])
