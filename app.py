@@ -19,7 +19,7 @@ def call_gemini(prompt: str) -> str:
     }
     for attempt in range(3):
         try:
-            res = requests.post(GEMINI_URL, json=payload, timeout=30)
+            res = requests.post(GEMINI_URL, json=payload, timeout=25)
             data = res.json()
             if "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -38,32 +38,19 @@ def call_gemini(prompt: str) -> str:
     return ""
 
 
-def make_search_query(student_q: str, today_str: str) -> str:
-    prompt = f"""Convert the student's question into a clean, high-signal English web search query for UPSC, TNPSC, and TNUSRB exam preparation.
-
-Rules:
-- Output ONLY the English search query (no quotes, no explanation, no extra text).
-- If the user asks for monthly or daily current affairs (in Tamil, English, or Tanglish), include keywords like: schemes, summits, appointments, awards, indices, India, Tamil Nadu, PIB.
-- Keep the exact month and year requested by the student. If no year is mentioned for current affairs, use the year from Today's Date.
-
-Today's Date: {today_str}
-Student Question: {student_q}"""
-    query = call_gemini(prompt)
-    return query if query else student_q
-
-
-def search_tavily(query: str) -> str:
+def search_tavily(query: str, today_str: str) -> str:
+    search_query = f"{query} UPSC TNPSC current affairs India Tamil Nadu {today_str[:4]}"
     try:
         res = requests.post(
             "https://api.tavily.com/search",
             json={
                 "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "advanced",
-                "max_results": 6,
+                "query": search_query,
+                "search_depth": "basic",
+                "max_results": 5,
                 "include_answer": True,
             },
-            timeout=30,
+            timeout=20,
         )
         data = res.json()
         if "results" not in data and "answer" not in data:
@@ -134,8 +121,7 @@ def webhook():
         )
         return "ok", 200
 
-    search_q = make_search_query(student_q, today_str)
-    search_ctx = search_tavily(search_q)
+    search_ctx = search_tavily(student_q, today_str)
     final_ans = generate_karka_answer(student_q, search_ctx, today_str)
     send_telegram(chat_id, final_ans)
     return "ok", 200
@@ -144,4 +130,3 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-    
