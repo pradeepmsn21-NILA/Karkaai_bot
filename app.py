@@ -10,28 +10,29 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
 
 def call_gemini(prompt: str) -> str:
     payload = {
         "contents": [{"parts": [{"text": prompt}]}]
     }
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            res = requests.post(GEMINI_URL, json=payload, timeout=25)
+            res = requests.post(GEMINI_URL, json=payload, timeout=30)
             data = res.json()
             if "candidates" in data:
                 return data["candidates"][0]["content"]["parts"][0]["text"].strip()
             print("GEMINI_ERROR:", data, flush=True)
             err_code = data.get("error", {}).get("code")
-            if err_code in (503, 429) and attempt < 2:
-                time.sleep(2 * (attempt + 1))
+            if err_code == 503 and attempt < 1:
+                time.sleep(2)
                 continue
             return ""
         except Exception as e:
             print("GEMINI_EXCEPTION:", str(e), flush=True)
-            if attempt < 2:
+            if attempt < 1:
                 time.sleep(2)
                 continue
             return ""
