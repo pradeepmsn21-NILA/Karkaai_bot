@@ -15,24 +15,26 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 
 MONTH_MAP = {
-    "january": "January", "jan": "January", "ஜனவரி": "January",
-    "february": "February", "feb": "February", "பிப்ரவரி": "February",
-    "march": "March", "mar": "March", "மார்ச்": "March",
-    "april": "April", "apr": "April", "ஏப்ரல்": "April",
-    "may": "May", "மே": "May",
-    "june": "June", "jun": "June", "ஜூன்": "June",
-    "july": "July", "jul": "July", "ஜூலை": "July",
-    "august": "August", "aug": "August", "ஆகஸ்ட்": "August",
-    "september": "September", "sep": "September", "sept": "September", "செப்டம்பர்": "September",
-    "october": "October", "oct": "October", "அக்டோபர்": "October",
-    "november": "November", "nov": "November", "நவம்பர்": "November",
-    "december": "December", "dec": "December", "டிசம்பர்": "December",
+    "january": "January", "jan": "January", "ஜனவரி": "January", "जनवरी": "January",
+    "february": "February", "feb": "February", "பிப்ரவரி": "February", "फरवरी": "February",
+    "march": "March", "mar": "March", "மார்ச்": "March", "मार्च": "March",
+    "april": "April", "apr": "April", "ஏப்ரல்": "April", "अप्रैल": "April",
+    "may": "May", "மே": "May", "मई": "May",
+    "june": "June", "jun": "June", "ஜூன்": "June", "जून": "June",
+    "july": "July", "jul": "July", "ஜூலை": "July", "जुलाई": "July",
+    "august": "August", "aug": "August", "ஆகஸ்ட்": "August", "अगस्त": "August",
+    "september": "September", "sep": "September", "sept": "September", "செப்டம்பர்": "September", "सितंबर": "September",
+    "october": "October", "oct": "October", "அக்டோபர்": "October", "अक्टूबर": "October",
+    "november": "November", "nov": "November", "நவம்பர்": "November", "नवंबर": "November",
+    "december": "December", "dec": "December", "டிசம்பர்": "December", "दिसंबर": "December",
 }
 
 CA_KEYWORDS = [
     "current affairs", "ca", "நடப்பு நிகழ்வுகள்", "நடப்பு", "news",
-    "scheme", "திட்டம்", "summit", "மாநாடு", "award", "விருது",
-    "appointment", "நியமனம்", "index", "குறியீடு", "budget", "பட்ஜெட்"
+    "scheme", "திட்டம்", "योजना", "summit", "மாநாடு", "सम्मेलन",
+    "award", "விருது", "पुरस्कार", "appointment", "நியமனம்", "नियुक्ति",
+    "index", "குறியீடு", "सूचकांक", "budget", "பட்ஜெட்", "बजट",
+    "करेंट अफेयर्स", "समसामयिकी", "sollunga", "pannunga", "kudunga"
 ]
 
 
@@ -148,11 +150,21 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
         )
         max_tokens = 900
 
+    language_rule = (
+        "Language Rule (CRITICAL): Detect the student's language and script/style carefully and reply in that EXACT SAME language:\n"
+        "- If the student writes in Tamil script, reply in clear exam-oriented Tamil.\n"
+        "- If the student writes in Hindi (Devanagari script), reply in clear exam-oriented Hindi.\n"
+        "- If the student writes in Tanglish (Tamil words written in English letters, like 'sollunga', 'pannunga', 'kudunga', 'vanakkam', 'epdi', 'nadappu nigalvugal'), reply in natural Tanglish (Tamil written in Latin script), not pure English.\n"
+        "- If the student writes in standard English, reply in clear exam-oriented English.\n"
+        "- If another Indian regional language is used, reply in that language as clearly as possible while keeping Rule 0 intact."
+    )
+
     prompt = (
         "Rule 0 (Identity - NEVER CHANGE): The very first line of every response MUST be written in English with exact spelling:\n"
         "Karka AI by Pranila Infotech.\n"
         'Never translate "Karka" into "Karnataka" or any other word.\n\n'
-        "Reply in the exact same language the student uses (Tamil, English, or Tanglish). Give clear, accurate, and exam-oriented answers tailored for UPSC, TNPSC, and TNUSRB exams.\n\n"
+        f"{language_rule}\n"
+        "Give clear, accurate, and exam-oriented answers tailored for UPSC, TNPSC, and TNUSRB exams.\n\n"
         "Strict Rules:\n"
         f"{length_rule}\n"
         "2. Formatting: Never use asterisks (*) or markdown bold/italics. Use clean plain text, hyphen bullet points (-), and relevant emojis only.\n"
@@ -170,7 +182,6 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
 
 def send_telegram(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # Telegram sendMessage max limit is 4096 characters; split cleanly if needed
     chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
     for chunk in chunks:
         try:
@@ -197,7 +208,7 @@ def webhook():
     student_q = msg["text"].strip()
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    greetings = {"hi", "hello", "hey", "vanakkam", "வணக்கம்", "hai"}
+    greetings = {"hi", "hello", "hey", "vanakkam", "வணக்கம்", "hai", "namaste", "नमस्ते"}
     if student_q.lower() in greetings:
         send_telegram(
             chat_id,
