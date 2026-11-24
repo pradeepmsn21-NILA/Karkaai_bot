@@ -1,15 +1,20 @@
 import os
 import re
 import time
+import json
 import datetime
+import threading
 import requests
 from flask import Flask, request
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+QUIZ_CHAT_ID = os.environ.get("QUIZ_CHAT_ID") or os.environ.get("TARGET_CHAT_ID")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -43,41 +48,61 @@ TANGLISH_MARKERS = {
     "nadappu", "pathil", "kelvi", "padippu", "thervu", "matrum", "illa", "tha", "thaan"
 }
 
+SUBJECTS_10 = [
+    "Indian Polity & Constitution",
+    "Indian & Tamil Nadu History",
+    "Geography",
+    "Indian Economy",
+    "General Science",
+    "Environment & Ecology",
+    "Current Affairs",
+    "Tamil Nadu Administration & Culture",
+    "Aptitude & Mental Ability",
+    "General Knowledge & Static GK",
+]
+
+_LAST_CHAT_ID_FILE = "/tmp/last_quiz_chat_id.txt"
+_QUIZ_LOCK = threading.Lock()
+
+
+def _save_last_chat_id(chat_id: int | str):
+    try:
+        with open(_LAST_CHAT_ID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(chat_id))
+    except Exception as e:
+        print("SAVE_CHAT_ID_ERR:", str(e), flush=True)
+
+
+def _get_quiz_target_chat_id() -> str | None:
+    if QUIZ_CHAT_ID:
+        return str(QUIZ_CHAT_ID).strip()
+    try:
+        if os.path.exists(_LAST_CHAT_ID_FILE):
+            with open(_LAST_CHAT_ID_FILE, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+                return val or None
+    except Exception:
+        pass
+    return None
+
 
 def detect_response_language(student_q: str) -> str:
-    # Tamil (U+0B80..U+0BFF)
     if re.search(r"[\u0B80-\u0BFF]", student_q):
         return "Tamil (in Tamil script only)"
-
-    # Devanagari / Hindi / Marathi (U+0900..U+097F)
     if re.search(r"[\u0900-\u097F]", student_q):
         return "Hindi (in Devanagari script only)"
-
-    # Telugu (U+0C00..U+0C7F)
     if re.search(r"[\u0C00-\u0C7F]", student_q):
         return "Telugu (in Telugu script only)"
-
-    # Malayalam (U+0D00..U+0D7F)
     if re.search(r"[\u0D00-\u0D7F]", student_q):
         return "Malayalam (in Malayalam script only)"
-
-    # Kannada (U+0C80..U+0CFF)
     if re.search(r"[\u0C80-\u0CFF]", student_q):
         return "Kannada (in Kannada script only)"
-
-    # Bengali / Assamese (U+0980..U+09FF)
     if re.search(r"[\u0980-\u09FF]", student_q):
         return "Bengali (in Bengali script only)"
-
-    # Gujarati (U+0A80..U+0AFF)
     if re.search(r"[\u0A80-\u0AFF]", student_q):
         return "Gujarati (in Gujarati script only)"
-
-    # Gurmukhi / Punjabi (U+0A00..U+0A7F)
     if re.search(r"[\u0A00-\u0A7F]", student_q):
         return "Punjabi (in Gurmukhi script only)"
-
-    # Odia (U+0B00..U+0B7F)
     if re.search(r"[\u0B00-\u0B7F]", student_q):
         return "Odia (in Odia script only)"
 
@@ -112,7 +137,6 @@ def call_gemini(prompt: str, max_output_tokens: int = 1200) -> str:
                     return parts[0]["text"].strip()
             print("GEMINI_ERROR:", data, flush=True)
             err_code = data.get("error", {}).get("code")
-            # Retry only on transient 503; do not retry on 429 quota exhaustion
             if err_code == 503 and attempt < 1:
                 time.sleep(2)
                 continue
@@ -224,7 +248,7 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
     return reply if reply else "Karka AI by Pranila Infotech.\nதற்போது பதிலை உருவாக்க முடியவில்லை, மீண்டும் முயற்சிக்கவும்."
 
 
-def send_telegram(chat_id: int, text: str):
+def send_telegram(chat_id: int | str, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
     for chunk in chunks:
@@ -234,6 +258,111 @@ def send_telegram(chat_id: int, text: str):
                 print("TELEGRAM_ERROR:", res.text, flush=True)
         except Exception as e:
             print("TELEGRAM_EXCEPTION:", str(e), flush=True)
+
+
+# --- Scheduled Trilingual 10-Subject MCQ Quiz Poll Generator (6 AM - 8 AM IST) ---
+def _generate_10_trilingual_mcqs() -> list[dict]:
+    prompt = (
+        "Generate exactly 10 multiple-choice questions for UPSC, TNPSC, and TNUSRB aspirants.\n"
+        f"Cover these 10 subjects in order (1 question per subject): {', '.join(SUBJECTS_10)}.\n"
+        "Each question must include 3 languages: Tamil (ta), English (en), and Tanglish (tg).\n"
+        "Return ONLY valid JSON (no markdown fences) as an array of 10 objects with keys:\n"
+        '[{"subject": "...", "q_ta": "...", "q_en": "...", "q_tg": "...", '
+        '"options": ["opt1 (TA/EN/TG)", "opt2 (TA/EN/TG)", "opt3 (TA/EN/TG)", "opt4 (TA/EN/TG)"], '
+        '"correct_option_id": 0, "explanation": "..."}]\n'
+        "Strict limits:\n"
+        "- q_ta, q_en, q_tg each <= 80 chars\n"
+        "- each item in options must have 4 concise strings, each <= 95 chars\n"
+        "- correct_option_id must be integer 0, 1, 2, or 3\n"
+        "- explanation <= 180 chars\n"
+    )
+    raw = call_gemini(prompt, max_output_tokens=3600)
+    if not raw:
+        return []
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.DOTALL).strip()
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            return parsed[:10]
+    except Exception as e:
+        print("QUIZ_JSON_PARSE_ERR:", str(e), cleaned[:400], flush=True)
+    return []
+
+
+def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict):
+    subj = str(item.get("subject", "General Studies")).strip()
+    q_ta = str(item.get("q_ta", "")).strip()
+    q_en = str(item.get("q_en", "")).strip()
+    q_tg = str(item.get("q_tg", "")).strip()
+
+    question_text = (
+        f"Q{q_num}/10 [{subj}]\n"
+        f"TA: {q_ta}\n"
+        f"EN: {q_en}\n"
+        f"TG: {q_tg}"
+    ).strip()[:300]
+
+    raw_opts = item.get("options") or []
+    options = [str(o).strip()[:100] for o in raw_opts if str(o).strip()][:4]
+    if len(options) < 2:
+        return
+
+    try:
+        correct_id = int(item.get("correct_option_id", 0))
+    except Exception:
+        correct_id = 0
+    if correct_id < 0 or correct_id >= len(options):
+        correct_id = 0
+
+    payload = {
+        "chat_id": chat_id,
+        "question": question_text,
+        "options": options,
+        "type": "quiz",
+        "correct_option_id": correct_id,
+        "is_anonymous": False,
+    }
+    explanation = str(item.get("explanation", "")).strip()[:200]
+    if explanation:
+        payload["explanation"] = explanation
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPoll"
+    try:
+        res = requests.post(url, json=payload, timeout=20)
+        if not res.ok:
+            print("POLL_SEND_ERR:", res.text, flush=True)
+    except Exception as e:
+        print("POLL_SEND_EXCEPTION:", str(e), flush=True)
+
+
+def run_daily_morning_quiz_job():
+    with _QUIZ_LOCK:
+        target_chat = _get_quiz_target_chat_id()
+        if not target_chat or not TELEGRAM_TOKEN:
+            print("DAILY_QUIZ_SKIPPED: missing target chat_id or TELEGRAM_TOKEN", flush=True)
+            return
+        questions = _generate_10_trilingual_mcqs()
+        if not questions:
+            print("DAILY_QUIZ_FAILED: no questions generated", flush=True)
+            return
+        send_telegram(
+            target_chat,
+            "Karka AI by Pranila Infotech.\n🌅 தினசரி 10 MCQ Quiz Poll (Tamil / English / Tanglish) தொடங்குகிறது!",
+        )
+        for idx, q in enumerate(questions, start=1):
+            _send_telegram_quiz_poll(target_chat, idx, q)
+            time.sleep(2)
+
+
+_scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+_scheduler.add_job(
+    run_daily_morning_quiz_job,
+    trigger=CronTrigger(hour=6, minute=30, timezone="Asia/Kolkata"),  # 6 AM - 8 AM IST window
+    id="daily_10_mcq_quiz_ist",
+    replace_existing=True,
+)
+_scheduler.start()
+# --------------------------------------------------------------------------------
 
 
 @app.route("/", methods=["GET"])
@@ -249,6 +378,7 @@ def webhook():
         return "ok", 200
 
     chat_id = msg["chat"]["id"]
+    _save_last_chat_id(chat_id)
     student_q = msg["text"].strip()
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
