@@ -314,13 +314,14 @@ def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict):
     if correct_id < 0 or correct_id >= len(options):
         correct_id = 0
 
+    is_channel = str(chat_id).strip().startswith("-100")
     payload = {
         "chat_id": chat_id,
         "question": question_text,
         "options": options,
         "type": "quiz",
         "correct_option_id": correct_id,
-        "is_anonymous": False,
+        "is_anonymous": True if is_channel else False,
     }
     explanation = str(item.get("explanation", "")).strip()[:200]
     if explanation:
@@ -378,8 +379,24 @@ def webhook():
         return "ok", 200
 
     chat_id = msg["chat"]["id"]
-    _save_last_chat_id(chat_id)
     student_q = msg["text"].strip()
+
+    if student_q.lower() == "/setquiz":
+        _save_last_chat_id(chat_id)
+        send_telegram(
+            chat_id,
+            "Karka AI by Pranila Infotech.\n✅ இந்த Chat தினசரி 10 MCQ Quiz Poll-க்கு செட் செய்யப்பட்டது (06:30 AM IST).",
+        )
+        return "ok", 200
+
+    if student_q.lower() == "/testquiz":
+        send_telegram(chat_id, "Karka AI by Pranila Infotech.\n⏳ Test Quiz Poll அனுப்பப்படுகிறது...")
+        threading.Thread(target=run_daily_morning_quiz_job, daemon=True).start()
+        return "ok", 200
+
+    if not QUIZ_CHAT_ID:
+        _save_last_chat_id(chat_id)
+
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
 
     greetings = {"hi", "hello", "hey", "vanakkam", "வணக்கம்", "hai", "namaste", "नमस्ते"}
