@@ -6,8 +6,6 @@ import datetime
 import threading
 import requests
 from flask import Flask, request
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
 
@@ -63,6 +61,8 @@ SUBJECTS_10 = [
 
 _LAST_CHAT_ID_FILE = "/tmp/last_quiz_chat_id.txt"
 _QUIZ_LOCK = threading.Lock()
+_SCHEDULER_STARTED = False
+_SCHEDULER_GUARD = threading.Lock()
 
 
 def _save_last_chat_id(chat_id: int | str):
@@ -355,14 +355,35 @@ def run_daily_morning_quiz_job():
             time.sleep(2)
 
 
-_scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
-_scheduler.add_job(
-    run_daily_morning_quiz_job,
-    trigger=CronTrigger(hour=6, minute=30, timezone="Asia/Kolkata"),  # 6 AM - 8 AM IST window
-    id="daily_10_mcq_quiz_ist",
-    replace_existing=True,
-)
-_scheduler.start()
+def _ist_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
+
+
+def _morning_quiz_loop():
+    last_sent_date = None
+    while True:
+        try:
+            now_ist = _ist_now()
+            today_key = now_ist.strftime("%Y-%m-%d")
+            # 06:30 AM IST window (6:30 AM - 6:35 AM IST)
+            if now_ist.hour == 6 and 30 <= now_ist.minute <= 35 and last_sent_date != today_key:
+                last_sent_date = today_key
+                run_daily_morning_quiz_job()
+        except Exception as e:
+            print("MORNING_LOOP_ERR:", str(e), flush=True)
+        time.sleep(30)
+
+
+def _start_morning_quiz_thread():
+    global _SCHEDULER_STARTED
+    with _SCHEDULER_GUARD:
+        if not _SCHEDULER_STARTED:
+            t = threading.Thread(target=_morning_quiz_loop, daemon=True)
+            t.start()
+            _SCHEDULER_STARTED = True
+
+
+_start_morning_quiz_thread()
 # --------------------------------------------------------------------------------
 
 
