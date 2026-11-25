@@ -15,7 +15,11 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 QUIZ_CHAT_ID = os.environ.get("QUIZ_CHAT_ID") or os.environ.get("TARGET_CHAT_ID")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
 MONTH_MAP = {
     "january": "January", "jan": "January", "ஜனவரி": "January", "जनवरी": "January",
@@ -120,33 +124,87 @@ def is_current_affairs_query(student_q: str) -> bool:
     return has_month or has_ca
 
 
-def call_gemini(prompt: str, max_output_tokens: int = 1200) -> str:
+def _gemini_url_for(model_name: str) -> str:
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+
+
+def _call_gemini_single_model(model_name: str, prompt: str, max_output_tokens: int) -> str:
+    if not GEMINI_API_KEY:
+        return ""
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "maxOutputTokens": max_output_tokens,
         },
     }
+    url = _gemini_url_for(model_name)
     for attempt in range(2):
         try:
-            res = requests.post(GEMINI_URL, json=payload, timeout=45)
+            res = requests.post(url, json=payload, timeout=45)
             data = res.json()
             if "candidates" in data:
                 parts = data["candidates"][0].get("content", {}).get("parts", [])
                 if parts and "text" in parts[0]:
                     return parts[0]["text"].strip()
-            print("GEMINI_ERROR:", data, flush=True)
+            print(f"GEMINI_ERROR ({model_name}):", data, flush=True)
             err_code = data.get("error", {}).get("code")
-            if err_code == 503 and attempt < 1:
+            if err_code in (429, 503) and attempt < 1:
                 time.sleep(2)
                 continue
             return ""
         except Exception as e:
-            print("GEMINI_EXCEPTION:", str(e), flush=True)
+            print(f"GEMINI_EXCEPTION ({model_name}):", str(e), flush=True)
             if attempt < 1:
                 time.sleep(2)
                 continue
             return ""
+    return ""
+
+
+def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200) -> str:
+    if not OPENAI_API_KEY:
+        return ""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": max_output_tokens,
+    }
+    try:
+        res = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=45)
+        data = res.json()
+        choices = data.get("choices") or []
+        if choices:
+            content = choices[0].get("message", {}).get("content", "")
+            if content:
+                print(f"OPENAI_FALLBACK_SUCCESS ({OPENAI_MODEL})", flush=True)
+                return content.strip()
+        print("OPENAI_ERROR:", data, flush=True)
+    except Exception as e:
+        print("OPENAI_EXCEPTION:", str(e), flush=True)
+    return ""
+
+
+def call_gemini(prompt: str, max_output_tokens: int = 1200) -> str:
+    text = _call_gemini_single_model(GEMINI_MODEL, prompt, max_output_tokens)
+    if text:
+        return text
+
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        print(f"GEMINI_FALLBACK -> {GEMINI_FALLBACK_MODEL}", flush=True)
+        fb_text = _call_gemini_single_model(GEMINI_FALLBACK_MODEL, prompt, max_output_tokens)
+        if fb_text:
+            return fb_text
+
+    if OPENAI_API_KEY:
+        print(f"SWITCHING_TO_OPENAI -> {OPENAI_MODEL}", flush=True)
+        return _call_openai_fallback(prompt, max_output_tokens=max_output_tokens)
+
     return ""
 
 
@@ -365,7 +423,6 @@ def _morning_quiz_loop():
         try:
             now_ist = _ist_now()
             today_key = now_ist.strftime("%Y-%m-%d")
-            # 06:30 AM IST window (6:30 AM - 6:35 AM IST)
             if now_ist.hour == 6 and 30 <= now_ist.minute <= 35 and last_sent_date != today_key:
                 last_sent_date = today_key
                 run_daily_morning_quiz_job()
