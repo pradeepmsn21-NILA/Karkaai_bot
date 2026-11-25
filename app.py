@@ -128,19 +128,23 @@ def _gemini_url_for(model_name: str) -> str:
     return f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
 
 
-def _call_gemini_single_model(model_name: str, prompt: str, max_output_tokens: int) -> str:
+def _call_gemini_single_model(
+    model_name: str, prompt: str, max_output_tokens: int, json_mode: bool = False
+) -> str:
     if not GEMINI_API_KEY:
         return ""
+    gen_cfg = {"maxOutputTokens": max_output_tokens}
+    if json_mode:
+        gen_cfg["responseMimeType"] = "application/json"
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "maxOutputTokens": max_output_tokens,
-        },
+        "generationConfig": gen_cfg,
     }
     url = _gemini_url_for(model_name)
     for attempt in range(2):
         try:
-            res = requests.post(url, json=payload, timeout=45)
+            res = requests.post(url, json=payload, timeout=50)
             data = res.json()
             if "candidates" in data:
                 parts = data["candidates"][0].get("content", {}).get("parts", [])
@@ -161,7 +165,7 @@ def _call_gemini_single_model(model_name: str, prompt: str, max_output_tokens: i
     return ""
 
 
-def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200) -> str:
+def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200, json_mode: bool = False) -> str:
     if not OPENAI_API_KEY:
         return ""
     headers = {
@@ -170,13 +174,13 @@ def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200) -> str:
     }
     payload = {
         "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_output_tokens,
     }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
     try:
-        res = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=45)
+        res = requests.post(OPENAI_CHAT_URL, headers=headers, json=payload, timeout=50)
         data = res.json()
         choices = data.get("choices") or []
         if choices:
@@ -190,20 +194,22 @@ def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200) -> str:
     return ""
 
 
-def call_gemini(prompt: str, max_output_tokens: int = 1200) -> str:
-    text = _call_gemini_single_model(GEMINI_MODEL, prompt, max_output_tokens)
+def call_gemini(prompt: str, max_output_tokens: int = 1200, json_mode: bool = False) -> str:
+    text = _call_gemini_single_model(GEMINI_MODEL, prompt, max_output_tokens, json_mode=json_mode)
     if text:
         return text
 
     if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
         print(f"GEMINI_FALLBACK -> {GEMINI_FALLBACK_MODEL}", flush=True)
-        fb_text = _call_gemini_single_model(GEMINI_FALLBACK_MODEL, prompt, max_output_tokens)
+        fb_text = _call_gemini_single_model(
+            GEMINI_FALLBACK_MODEL, prompt, max_output_tokens, json_mode=json_mode
+        )
         if fb_text:
             return fb_text
 
     if OPENAI_API_KEY:
         print(f"SWITCHING_TO_OPENAI -> {OPENAI_MODEL}", flush=True)
-        return _call_openai_fallback(prompt, max_output_tokens=max_output_tokens)
+        return _call_openai_fallback(prompt, max_output_tokens=max_output_tokens, json_mode=json_mode)
 
     return ""
 
@@ -319,32 +325,49 @@ def send_telegram(chat_id: int | str, text: str):
 
 
 # --- Scheduled Trilingual 10-Subject MCQ Quiz Poll Generator (6 AM - 8 AM IST) ---
-def _generate_10_trilingual_mcqs() -> list[dict]:
-    prompt = (
-        "Generate exactly 10 multiple-choice questions for UPSC, TNPSC, and TNUSRB aspirants.\n"
-        f"Cover these 10 subjects in order (1 question per subject): {', '.join(SUBJECTS_10)}.\n"
-        "Each question must include 3 languages: Tamil (ta), English (en), and Tanglish (tg).\n"
-        "Return ONLY valid JSON (no markdown fences) as an array of 10 objects with keys:\n"
-        '[{"subject": "...", "q_ta": "...", "q_en": "...", "q_tg": "...", '
-        '"options": ["opt1 (TA/EN/TG)", "opt2 (TA/EN/TG)", "opt3 (TA/EN/TG)", "opt4 (TA/EN/TG)"], '
-        '"correct_option_id": 0, "explanation": "..."}]\n'
-        "Strict limits:\n"
-        "- q_ta, q_en, q_tg each <= 80 chars\n"
-        "- each item in options must have 4 concise strings, each <= 95 chars\n"
-        "- correct_option_id must be integer 0, 1, 2, or 3\n"
-        "- explanation <= 180 chars\n"
-    )
-    raw = call_gemini(prompt, max_output_tokens=3600)
+def _parse_quiz_batch(raw: str) -> list[dict]:
     if not raw:
         return []
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.DOTALL).strip()
     try:
         parsed = json.loads(cleaned)
         if isinstance(parsed, list):
-            return parsed[:10]
+            return [x for x in parsed if isinstance(x, dict)]
+        if isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
     except Exception as e:
-        print("QUIZ_JSON_PARSE_ERR:", str(e), cleaned[:400], flush=True)
+        print("QUIZ_JSON_PARSE_ERR:", str(e), cleaned[:300], flush=True)
     return []
+
+
+def _generate_quiz_batch(subjects_batch: list[str]) -> list[dict]:
+    count = len(subjects_batch)
+    prompt = (
+        f"Generate exactly {count} concise multiple-choice questions for UPSC, TNPSC, and TNUSRB.\n"
+        f"Subjects in exact order: {', '.join(subjects_batch)}.\n"
+        "Return a JSON array of objects with keys:\n"
+        '[{"subject": "...", "q_ta": "...", "q_en": "...", "q_tg": "...", '
+        '"options": ["opt1", "opt2", "opt3", "opt4"], '
+        '"correct_option_id": 0, "explanation": "..."}]\n'
+        "Keep strings very short so JSON never truncates:\n"
+        "- q_ta, q_en, q_tg each <= 65 chars\n"
+        "- options: 4 short strings, each <= 75 chars\n"
+        "- correct_option_id: integer 0..3\n"
+        "- explanation <= 120 chars\n"
+    )
+    raw = call_gemini(prompt, max_output_tokens=2800, json_mode=True)
+    items = _parse_quiz_batch(raw)
+    return items[:count]
+
+
+def _generate_10_trilingual_mcqs() -> list[dict]:
+    first_5 = _generate_quiz_batch(SUBJECTS_10[:5])
+    time.sleep(1)
+    second_5 = _generate_quiz_batch(SUBJECTS_10[5:])
+    combined = (first_5 + second_5)[:10]
+    return combined
 
 
 def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict):
