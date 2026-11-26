@@ -14,7 +14,11 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-QUIZ_CHAT_ID = os.environ.get("QUIZ_CHAT_ID") or os.environ.get("CHANNEL_CHAT_ID") or os.environ.get("TARGET_CHAT_ID")
+QUIZ_CHAT_ID = (
+    os.environ.get("QUIZ_CHAT_ID")
+    or os.environ.get("CHANNEL_CHAT_ID")
+    or os.environ.get("TARGET_CHAT_ID")
+)
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
@@ -48,14 +52,8 @@ CA_KEYWORDS = [
     "scheme", "திட்டம்", "योजना", "summit", "மாநாடு", "सम्मेलन",
     "award", "விருது", "पुरस्कार", "appointment", "நியமனம்", "नियुक्ति",
     "index", "குறியீடு", "सूचकांक", "budget", "பட்ஜெட்", "बजट",
-    "करेंट अफेयर्स", "समसामयिकी", "sollunga", "pannunga", "kudunga", "nigalvugal"
+    "करेंट अफेयर्स", "समसामयिकी",
 ]
-
-TANGLISH_MARKERS = {
-    "sollunga", "pannunga", "kudunga", "vanakkam", "epdi", "eppadi", "enna",
-    "yaaru", "yaru", "theriyuma", "venum", "irukku", "iruku", "nigalvugal",
-    "nadappu", "pathil", "kelvi", "padippu", "thervu", "matrum", "illa", "tha", "thaan"
-}
 
 SUBJECTS_10 = [
     "Indian Polity & Constitution",
@@ -107,7 +105,7 @@ def _compute_question_hash(item: dict) -> str:
     base = " | ".join([
         str(item.get("q_en", "")).lower().strip(),
         str(item.get("q_ta", "")).lower().strip(),
-        str(item.get("q_tg", "")).lower().strip(),
+        str(item.get("q_hi", "")).lower().strip(),
     ])
     cleaned = re.sub(r"\s+", " ", base).strip()
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
@@ -236,26 +234,7 @@ def detect_response_language(student_q: str) -> str:
         return "Tamil (in Tamil script only)"
     if re.search(r"[\u0900-\u097F]", student_q):
         return "Hindi (in Devanagari script only)"
-    if re.search(r"[\u0C00-\u0C7F]", student_q):
-        return "Telugu (in Telugu script only)"
-    if re.search(r"[\u0D00-\u0D7F]", student_q):
-        return "Malayalam (in Malayalam script only)"
-    if re.search(r"[\u0C80-\u0CFF]", student_q):
-        return "Kannada (in Kannada script only)"
-    if re.search(r"[\u0980-\u09FF]", student_q):
-        return "Bengali (in Bengali script only)"
-    if re.search(r"[\u0A80-\u0AFF]", student_q):
-        return "Gujarati (in Gujarati script only)"
-    if re.search(r"[\u0A00-\u0A7F]", student_q):
-        return "Punjabi (in Gurmukhi script only)"
-    if re.search(r"[\u0B00-\u0B7F]", student_q):
-        return "Odia (in Odia script only)"
-
-    words = set(re.findall(r"[a-zA-Z]+", student_q.lower()))
-    if words & TANGLISH_MARKERS:
-        return "Tanglish (Tamil words written in English letters, matching the user's Tanglish style)"
-
-    return "Pure English (standard English only; do NOT use Tanglish)"
+    return "English (standard English only)"
 
 
 def is_current_affairs_query(student_q: str) -> bool:
@@ -266,7 +245,10 @@ def is_current_affairs_query(student_q: str) -> bool:
 
 
 def _gemini_url_for(model_name: str) -> str:
-    return f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+    return (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent?key={GEMINI_API_KEY}"
+    )
 
 
 def _call_gemini_single_model(
@@ -403,7 +385,10 @@ def build_search_query(student_q: str, today_str: str) -> tuple[str, str, int]:
 
     if is_current_affairs_query(student_q):
         month_part = f"{detected_month} " if detected_month else ""
-        query = f"{month_part}{year} world international national India Tamil Nadu current affairs PIB schemes awards summits UPSC TNPSC"
+        query = (
+            f"{month_part}{year} world international national India Tamil Nadu "
+            "current affairs PIB schemes awards summits UPSC TNPSC"
+        )
         return query, "advanced", 8
 
     clean_q = re.sub(r"[^\w\s]", " ", student_q).strip()
@@ -447,14 +432,16 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
 
     if ca_mode:
         length_rule = (
-            "1. Length & Depth: For current affairs queries, provide a comprehensive, exam-focused compilation up to 3000 words when verified facts support it, without fluff or filler."
+            "1. Length & Depth: For current affairs queries, provide a comprehensive, "
+            "exam-focused compilation up to 3000 words when verified facts support it, without fluff or filler."
         )
         order_rule = (
             "4. Current Affairs Order & Structure: ALWAYS organize current affairs strictly in this exact order:\n"
             "   First: Worldwide / International Current Affairs\n"
             "   Second: National (India) Current Affairs\n"
             "   Third: Tamil Nadu Current Affairs\n"
-            "   Use ONLY verified facts from the search results. Clearly note if a specific section or month has limited/unavailable verified data in the results rather than inventing facts."
+            "   Use ONLY verified facts from the search results. Clearly note if a specific section "
+            "or month has limited/unavailable verified data in the results rather than inventing facts."
         )
         max_tokens = 3800
     else:
@@ -462,12 +449,14 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
             "1. Length: Keep the response concise (ideally 120 to 240 words) for Telegram."
         )
         order_rule = (
-            "4. Current Affairs & Live Data: Use ONLY verified facts from the provided search results when answering current/live questions."
+            "4. Current Affairs & Live Data: Use ONLY verified facts from the provided search results "
+            "when answering current/live questions."
         )
         max_tokens = 900
 
     prompt = (
-        "Rule 0 (Identity - NEVER CHANGE): The very first line of every response MUST be written in English with exact spelling:\n"
+        "Rule 0 (Identity - NEVER CHANGE): The very first line of every response MUST be written "
+        "in English with exact spelling:\n"
         "Karka AI by Pranila Infotech.\n"
         'Never translate "Karka" into "Karnataka" or any other word.\n\n'
         f"Target Language (MANDATORY): Write the entire response body (after line 1) in {target_lang}. "
@@ -475,10 +464,13 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
         "Give clear, accurate, and exam-oriented answers tailored for UPSC, TNPSC, and TNUSRB exams.\n\n"
         "Strict Rules:\n"
         f"{length_rule}\n"
-        "2. Formatting: Never use asterisks (*) or markdown bold/italics. Use clean plain text, hyphen bullet points (-), and relevant emojis only.\n"
-        "3. No Coaching/Academy Names: NEVER mention, recommend, or promote any coaching institute, IAS/TNPSC academy, website, or third-party brand name in the answer. Present only direct exam facts.\n"
+        "2. Formatting: Never use asterisks (*) or markdown bold/italics. Use clean plain text, "
+        "hyphen bullet points (-), and relevant emojis only.\n"
+        "3. No Coaching/Academy Names: NEVER mention, recommend, or promote any coaching institute, "
+        "IAS/TNPSC academy, website, or third-party brand name in the answer. Present only direct exam facts.\n"
         f"{order_rule}\n"
-        "5. Ambiguous/Misleading Queries: Clearly separate facts and clarify actual constitutional/official positions without guessing.\n"
+        "5. Ambiguous/Misleading Queries: Clearly separate facts and clarify actual constitutional/official "
+        "positions without guessing.\n"
         "6. Safety: Strictly refuse sexually explicit content, inappropriate queries, or illegal activities.\n\n"
         f"Today's Date: {today_str}\n"
         f"Student's Question: {student_q}\n\n"
@@ -502,7 +494,7 @@ def send_telegram(chat_id: int | str, text: str):
             print("TELEGRAM_EXCEPTION:", str(e), flush=True)
 
 
-# --- Scheduled Trilingual 10-Subject MCQ Quiz Poll Generator (No Repeat + Mixed Syllabus) ---
+# --- Scheduled Tamil + English + Hindi 10-Subject MCQ Quiz Poll Generator ---
 def _parse_quiz_batch(raw: str) -> list[dict]:
     if not raw:
         return []
@@ -531,15 +523,17 @@ def _generate_quiz_batch(
         f"Seed: {seed_tag} | Date: {_ist_now().strftime('%Y-%m-%d %H:%M IST')}\n"
         f"Generate exactly {count} brand-new, distinct multiple-choice questions for UPSC, TNPSC, and TNUSRB.\n"
         f"Mixed syllabus subjects in order: {', '.join(subjects_batch)}.\n"
+        "Languages required for each question: Tamil (Tamil script), English, and Hindi (Devanagari script) ONLY. "
+        "Do NOT use Tanglish or Hinglish.\n"
         "Pick different sub-topics and facts each time; do NOT repeat yesterday's or recent questions.\n"
         "STRICTLY DO NOT repeat or rephrase any of these previously sent questions:\n"
         f"{avoid_block}\n\n"
         "Return ONLY a JSON array of objects with keys:\n"
-        '[{"subject": "...", "q_ta": "...", "q_en": "...", "q_tg": "...", '
+        '[{"subject": "...", "q_ta": "...", "q_en": "...", "q_hi": "...", '
         '"options": ["opt1", "opt2", "opt3", "opt4"], '
         '"correct_option_id": 0, "explanation": "..."}]\n'
         "Keep strings concise so JSON never truncates:\n"
-        "- q_ta, q_en, q_tg each <= 65 chars\n"
+        "- q_ta, q_en, q_hi each <= 65 chars\n"
         "- options: 4 short strings, each <= 75 chars\n"
         "- correct_option_id: integer 0..3\n"
         "- explanation <= 120 chars\n"
@@ -566,9 +560,9 @@ def _generate_10_trilingual_mcqs() -> list[dict]:
         for item in candidates:
             q_en = str(item.get("q_en", "")).strip()
             q_ta = str(item.get("q_ta", "")).strip()
-            q_tg = str(item.get("q_tg", "")).strip()
+            q_hi = str(item.get("q_hi", "")).strip()
             opts = item.get("options") or []
-            if not (q_en or q_ta) or len(opts) < 2:
+            if not (q_en or q_ta or q_hi) or len(opts) < 2:
                 continue
 
             h = _compute_question_hash(item)
@@ -579,7 +573,7 @@ def _generate_10_trilingual_mcqs() -> list[dict]:
             item["hash"] = h
             collected.append(item)
             local_batch_hashes.add(h)
-            recent_summaries.append(f"[{item.get('subject', '')}] {q_en or q_ta}")
+            recent_summaries.append(f"[{item.get('subject', '')}] {q_en or q_ta or q_hi}")
             if len(collected) >= 10:
                 break
 
@@ -592,13 +586,13 @@ def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict) -> bool
     subj = str(item.get("subject", "General Studies")).strip()
     q_ta = str(item.get("q_ta", "")).strip()
     q_en = str(item.get("q_en", "")).strip()
-    q_tg = str(item.get("q_tg", "")).strip()
+    q_hi = str(item.get("q_hi", "")).strip()
 
     question_text = (
         f"Q{q_num}/10 [{subj}]\n"
         f"TA: {q_ta}\n"
         f"EN: {q_en}\n"
-        f"TG: {q_tg}"
+        f"HI: {q_hi}"
     ).strip()[:300]
 
     raw_opts = item.get("options") or []
@@ -650,7 +644,8 @@ def run_daily_morning_quiz_job():
             return
         send_telegram(
             target_chat,
-            "Karka AI by Pranila Infotech.\n🌅 தினசரி புதிய 10 MCQ Quiz Poll (Mixed Syllabus — Tamil / English / Tanglish) தொடங்குகிறது!",
+            "Karka AI by Pranila Infotech.\n"
+            "🌅 தினசரி புதிய 10 MCQ Quiz Poll (Tamil / English / हिन्दी) தொடங்குகிறது!",
         )
         sent_items: list[dict] = []
         for idx, q in enumerate(questions, start=1):
@@ -722,12 +717,17 @@ def webhook():
         _save_last_chat_id(target_id)
         send_telegram(
             chat_id,
-            f"Karka AI by Pranila Infotech.\n✅ Target Chat/Channel ({target_id}) தினசரி 10 MCQ Quiz Poll-க்கு செட் செய்யப்பட்டது (06:30 AM IST).",
+            f"Karka AI by Pranila Infotech.\n"
+            f"✅ Target Chat/Channel ({target_id}) தினசரி 10 MCQ Quiz Poll-க்கு செட் செய்யப்பட்டது (06:30 AM IST).",
         )
         return "ok", 200
 
     if student_q.lower().startswith("/testquiz"):
-        send_telegram(chat_id, "Karka AI by Pranila Infotech.\n⏳ புதிய Mixed Syllabus Test Quiz Poll அனுப்பப்படுகிறது...")
+        send_telegram(
+            chat_id,
+            "Karka AI by Pranila Infotech.\n"
+            "⏳ புதிய Mixed Syllabus Test Quiz Poll (Tamil / English / हिन्दी) அனுப்பப்படுகிறது...",
+        )
         threading.Thread(target=run_daily_morning_quiz_job, daemon=True).start()
         return "ok", 200
 
@@ -736,11 +736,14 @@ def webhook():
 
     today_str = _ist_now().strftime("%Y-%m-%d")
 
-    greetings = {"hi", "hello", "hey", "vanakkam", "வணக்கம்", "hai", "namaste", "नमस्ते"}
+    greetings = {
+        "hi", "hello", "hey", "vanakkam", "வணக்கம்", "hai", "namaste", "नमस्ते",
+    }
     if student_q.lower() in greetings:
         send_telegram(
             chat_id,
-            "Karka AI by Pranila Infotech.\nவணக்கம்! UPSC, TNPSC மற்றும் TNUSRB தேர்வுகளுக்கான உங்கள் கேள்வியை அல்லது நடப்பு நிகழ்வுகளைக் கேளுங்கள்.",
+            "Karka AI by Pranila Infotech.\n"
+            "வணக்கம்! UPSC, TNPSC மற்றும் TNUSRB தேர்வுகளுக்கான உங்கள் கேள்வியை அல்லது நடப்பு நிகழ்வுகளைக் கேளுங்கள்.",
         )
         return "ok", 200
 
