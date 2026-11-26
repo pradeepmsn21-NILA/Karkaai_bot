@@ -2,17 +2,24 @@ import os
 import re
 import time
 import json
+import hashlib
+import random
 import datetime
 import threading
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
-QUIZ_CHAT_ID = os.environ.get("QUIZ_CHAT_ID") or os.environ.get("TARGET_CHAT_ID")
+QUIZ_CHAT_ID = os.environ.get("QUIZ_CHAT_ID") or os.environ.get("CHANNEL_CHAT_ID") or os.environ.get("TARGET_CHAT_ID")
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_QUIZ_TABLE = os.environ.get("SUPABASE_QUIZ_TABLE", "quiz_history")
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
@@ -64,9 +71,15 @@ SUBJECTS_10 = [
 ]
 
 _LAST_CHAT_ID_FILE = "/tmp/last_quiz_chat_id.txt"
+_QUIZ_HISTORY_FILE = "/tmp/sent_quiz_history.json"
 _QUIZ_LOCK = threading.Lock()
+_HISTORY_LOCK = threading.Lock()
 _SCHEDULER_STARTED = False
 _SCHEDULER_GUARD = threading.Lock()
+
+
+def _ist_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
 
 
 def _save_last_chat_id(chat_id: int | str):
@@ -88,6 +101,134 @@ def _get_quiz_target_chat_id() -> str | None:
     except Exception:
         pass
     return None
+
+
+def _compute_question_hash(item: dict) -> str:
+    base = " | ".join([
+        str(item.get("q_en", "")).lower().strip(),
+        str(item.get("q_ta", "")).lower().strip(),
+        str(item.get("q_tg", "")).lower().strip(),
+    ])
+    cleaned = re.sub(r"\s+", " ", base).strip()
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()
+
+
+def _load_local_history() -> list[dict]:
+    try:
+        if os.path.exists(_QUIZ_HISTORY_FILE):
+            with open(_QUIZ_HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception as e:
+        print("LOAD_QUIZ_HISTORY_ERR:", str(e), flush=True)
+    return []
+
+
+def _save_local_history(entries: list[dict]):
+    try:
+        with open(_QUIZ_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(entries[-300:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("SAVE_QUIZ_HISTORY_ERR:", str(e), flush=True)
+
+
+def _fetch_supabase_history(limit: int = 120) -> list[dict]:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_QUIZ_TABLE}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    params = {
+        "select": "q_hash,subject,q_en,q_ta,created_at",
+        "order": "id.desc",
+        "limit": str(limit),
+    }
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=15)
+        if res.ok and isinstance(res.json(), list):
+            return [
+                {
+                    "hash": row.get("q_hash", ""),
+                    "subject": row.get("subject", ""),
+                    "q_en": row.get("q_en", ""),
+                    "q_ta": row.get("q_ta", ""),
+                }
+                for row in res.json()
+            ]
+    except Exception as e:
+        print("SUPABASE_FETCH_ERR:", str(e), flush=True)
+    return []
+
+
+def _record_supabase_history(new_entries: list[dict]):
+    if not SUPABASE_URL or not SUPABASE_KEY or not new_entries:
+        return
+    url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_QUIZ_TABLE}"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    payload = [
+        {
+            "q_hash": e.get("hash", ""),
+            "subject": e.get("subject", ""),
+            "q_en": e.get("q_en", ""),
+            "q_ta": e.get("q_ta", ""),
+        }
+        for e in new_entries
+    ]
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=15)
+        if not res.ok:
+            print("SUPABASE_INSERT_ERR:", res.text, flush=True)
+    except Exception as e:
+        print("SUPABASE_INSERT_EXCEPTION:", str(e), flush=True)
+
+
+def _get_recent_history() -> tuple[set[str], list[str]]:
+    with _HISTORY_LOCK:
+        local_items = _load_local_history()
+        supa_items = _fetch_supabase_history(limit=120)
+
+        seen_hashes: set[str] = set()
+        recent_summaries: list[str] = []
+
+        for row in supa_items + local_items:
+            h = str(row.get("hash", "")).strip()
+            if h:
+                seen_hashes.add(h)
+            summary = f"[{row.get('subject', '')}] {row.get('q_en') or row.get('q_ta') or ''}".strip()
+            if summary and summary not in recent_summaries:
+                recent_summaries.append(summary)
+
+        return seen_hashes, recent_summaries[-40:]
+
+
+def _save_sent_questions(items: list[dict]):
+    with _HISTORY_LOCK:
+        existing = _load_local_history()
+        existing_hashes = {str(x.get("hash", "")).strip() for x in existing}
+        added: list[dict] = []
+        for item in items:
+            h = item.get("hash") or _compute_question_hash(item)
+            if h and h not in existing_hashes:
+                entry = {
+                    "hash": h,
+                    "subject": str(item.get("subject", "")).strip(),
+                    "q_en": str(item.get("q_en", "")).strip(),
+                    "q_ta": str(item.get("q_ta", "")).strip(),
+                    "date": _ist_now().strftime("%Y-%m-%d"),
+                }
+                existing.append(entry)
+                existing_hashes.add(h)
+                added.append(entry)
+        _save_local_history(existing)
+        _record_supabase_history(added)
 
 
 def detect_response_language(student_q: str) -> str:
@@ -129,11 +270,18 @@ def _gemini_url_for(model_name: str) -> str:
 
 
 def _call_gemini_single_model(
-    model_name: str, prompt: str, max_output_tokens: int, json_mode: bool = False
+    model_name: str,
+    prompt: str,
+    max_output_tokens: int,
+    json_mode: bool = False,
+    temperature: float = 0.7,
 ) -> str:
     if not GEMINI_API_KEY:
         return ""
-    gen_cfg = {"maxOutputTokens": max_output_tokens}
+    gen_cfg = {
+        "maxOutputTokens": max_output_tokens,
+        "temperature": temperature,
+    }
     if json_mode:
         gen_cfg["responseMimeType"] = "application/json"
 
@@ -165,7 +313,12 @@ def _call_gemini_single_model(
     return ""
 
 
-def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200, json_mode: bool = False) -> str:
+def _call_openai_fallback(
+    prompt: str,
+    max_output_tokens: int = 1200,
+    json_mode: bool = False,
+    temperature: float = 0.7,
+) -> str:
     if not OPENAI_API_KEY:
         return ""
     headers = {
@@ -176,6 +329,7 @@ def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200, json_mode:
         "model": OPENAI_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_output_tokens,
+        "temperature": temperature,
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -194,22 +348,42 @@ def _call_openai_fallback(prompt: str, max_output_tokens: int = 1200, json_mode:
     return ""
 
 
-def call_gemini(prompt: str, max_output_tokens: int = 1200, json_mode: bool = False) -> str:
-    text = _call_gemini_single_model(GEMINI_MODEL, prompt, max_output_tokens, json_mode=json_mode)
+def call_gemini(
+    prompt: str,
+    max_output_tokens: int = 1200,
+    json_mode: bool = False,
+    temperature: float = 0.7,
+) -> str:
+    text = _call_gemini_single_model(
+        GEMINI_MODEL,
+        prompt,
+        max_output_tokens,
+        json_mode=json_mode,
+        temperature=temperature,
+    )
     if text:
         return text
 
     if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
         print(f"GEMINI_FALLBACK -> {GEMINI_FALLBACK_MODEL}", flush=True)
         fb_text = _call_gemini_single_model(
-            GEMINI_FALLBACK_MODEL, prompt, max_output_tokens, json_mode=json_mode
+            GEMINI_FALLBACK_MODEL,
+            prompt,
+            max_output_tokens,
+            json_mode=json_mode,
+            temperature=temperature,
         )
         if fb_text:
             return fb_text
 
     if OPENAI_API_KEY:
         print(f"SWITCHING_TO_OPENAI -> {OPENAI_MODEL}", flush=True)
-        return _call_openai_fallback(prompt, max_output_tokens=max_output_tokens, json_mode=json_mode)
+        return _call_openai_fallback(
+            prompt,
+            max_output_tokens=max_output_tokens,
+            json_mode=json_mode,
+            temperature=temperature,
+        )
 
     return ""
 
@@ -238,6 +412,8 @@ def build_search_query(student_q: str, today_str: str) -> tuple[str, str, int]:
 
 
 def search_tavily(student_q: str, today_str: str) -> str:
+    if not TAVILY_API_KEY:
+        return "No search API key configured."
     search_query, depth, max_results = build_search_query(student_q, today_str)
     try:
         res = requests.post(
@@ -308,11 +484,13 @@ def generate_karka_answer(student_q: str, search_context: str, today_str: str) -
         f"Student's Question: {student_q}\n\n"
         f"Verified Online Search Results:\n{search_context}"
     )
-    reply = call_gemini(prompt, max_output_tokens=max_tokens)
+    reply = call_gemini(prompt, max_output_tokens=max_tokens, temperature=0.5)
     return reply if reply else "Karka AI by Pranila Infotech.\nதற்போது பதிலை உருவாக்க முடியவில்லை, மீண்டும் முயற்சிக்கவும்."
 
 
 def send_telegram(chat_id: int | str, text: str):
+    if not TELEGRAM_TOKEN:
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
     for chunk in chunks:
@@ -324,7 +502,7 @@ def send_telegram(chat_id: int | str, text: str):
             print("TELEGRAM_EXCEPTION:", str(e), flush=True)
 
 
-# --- Scheduled Trilingual 10-Subject MCQ Quiz Poll Generator (6 AM - 8 AM IST) ---
+# --- Scheduled Trilingual 10-Subject MCQ Quiz Poll Generator (No Repeat + Mixed Syllabus) ---
 def _parse_quiz_batch(raw: str) -> list[dict]:
     if not raw:
         return []
@@ -342,35 +520,75 @@ def _parse_quiz_batch(raw: str) -> list[dict]:
     return []
 
 
-def _generate_quiz_batch(subjects_batch: list[str]) -> list[dict]:
+def _generate_quiz_batch(
+    subjects_batch: list[str],
+    avoid_summaries: list[str],
+    seed_tag: str,
+) -> list[dict]:
     count = len(subjects_batch)
+    avoid_block = "\n".join(f"- {s[:140]}" for s in avoid_summaries[-30:]) or "None"
     prompt = (
-        f"Generate exactly {count} concise multiple-choice questions for UPSC, TNPSC, and TNUSRB.\n"
-        f"Subjects in exact order: {', '.join(subjects_batch)}.\n"
-        "Return a JSON array of objects with keys:\n"
+        f"Seed: {seed_tag} | Date: {_ist_now().strftime('%Y-%m-%d %H:%M IST')}\n"
+        f"Generate exactly {count} brand-new, distinct multiple-choice questions for UPSC, TNPSC, and TNUSRB.\n"
+        f"Mixed syllabus subjects in order: {', '.join(subjects_batch)}.\n"
+        "Pick different sub-topics and facts each time; do NOT repeat yesterday's or recent questions.\n"
+        "STRICTLY DO NOT repeat or rephrase any of these previously sent questions:\n"
+        f"{avoid_block}\n\n"
+        "Return ONLY a JSON array of objects with keys:\n"
         '[{"subject": "...", "q_ta": "...", "q_en": "...", "q_tg": "...", '
         '"options": ["opt1", "opt2", "opt3", "opt4"], '
         '"correct_option_id": 0, "explanation": "..."}]\n'
-        "Keep strings very short so JSON never truncates:\n"
+        "Keep strings concise so JSON never truncates:\n"
         "- q_ta, q_en, q_tg each <= 65 chars\n"
         "- options: 4 short strings, each <= 75 chars\n"
         "- correct_option_id: integer 0..3\n"
         "- explanation <= 120 chars\n"
     )
-    raw = call_gemini(prompt, max_output_tokens=2800, json_mode=True)
+    raw = call_gemini(prompt, max_output_tokens=2800, json_mode=True, temperature=0.88)
     items = _parse_quiz_batch(raw)
     return items[:count]
 
 
 def _generate_10_trilingual_mcqs() -> list[dict]:
-    first_5 = _generate_quiz_batch(SUBJECTS_10[:5])
-    time.sleep(1)
-    second_5 = _generate_quiz_batch(SUBJECTS_10[5:])
-    combined = (first_5 + second_5)[:10]
-    return combined
+    seen_hashes, recent_summaries = _get_recent_history()
+    shuffled_subjects = random.sample(SUBJECTS_10, k=len(SUBJECTS_10))
+    collected: list[dict] = []
+    local_batch_hashes: set[str] = set()
+
+    for round_idx in range(3):
+        remaining = 10 - len(collected)
+        if remaining <= 0:
+            break
+        batch_subjects = shuffled_subjects[: min(5, remaining)]
+        seed_tag = f"{_ist_now().strftime('%Y%m%d%H%M%S')}-r{round_idx}-{random.randint(1000, 9999)}"
+        candidates = _generate_quiz_batch(batch_subjects, recent_summaries, seed_tag)
+
+        for item in candidates:
+            q_en = str(item.get("q_en", "")).strip()
+            q_ta = str(item.get("q_ta", "")).strip()
+            q_tg = str(item.get("q_tg", "")).strip()
+            opts = item.get("options") or []
+            if not (q_en or q_ta) or len(opts) < 2:
+                continue
+
+            h = _compute_question_hash(item)
+            if h in seen_hashes or h in local_batch_hashes:
+                print("DUPLICATE_QUIZ_SKIPPED:", h[:12], q_en[:50], flush=True)
+                continue
+
+            item["hash"] = h
+            collected.append(item)
+            local_batch_hashes.add(h)
+            recent_summaries.append(f"[{item.get('subject', '')}] {q_en or q_ta}")
+            if len(collected) >= 10:
+                break
+
+        time.sleep(1)
+
+    return collected[:10]
 
 
-def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict):
+def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict) -> bool:
     subj = str(item.get("subject", "General Studies")).strip()
     q_ta = str(item.get("q_ta", "")).strip()
     q_en = str(item.get("q_en", "")).strip()
@@ -386,7 +604,7 @@ def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict):
     raw_opts = item.get("options") or []
     options = [str(o).strip()[:100] for o in raw_opts if str(o).strip()][:4]
     if len(options) < 2:
-        return
+        return False
 
     try:
         correct_id = int(item.get("correct_option_id", 0))
@@ -413,8 +631,11 @@ def _send_telegram_quiz_poll(chat_id: int | str, q_num: int, item: dict):
         res = requests.post(url, json=payload, timeout=20)
         if not res.ok:
             print("POLL_SEND_ERR:", res.text, flush=True)
+            return False
+        return True
     except Exception as e:
         print("POLL_SEND_EXCEPTION:", str(e), flush=True)
+        return False
 
 
 def run_daily_morning_quiz_job():
@@ -425,19 +646,21 @@ def run_daily_morning_quiz_job():
             return
         questions = _generate_10_trilingual_mcqs()
         if not questions:
-            print("DAILY_QUIZ_FAILED: no questions generated", flush=True)
+            print("DAILY_QUIZ_FAILED: no new unique questions generated", flush=True)
             return
         send_telegram(
             target_chat,
-            "Karka AI by Pranila Infotech.\n🌅 தினசரி 10 MCQ Quiz Poll (Tamil / English / Tanglish) தொடங்குகிறது!",
+            "Karka AI by Pranila Infotech.\n🌅 தினசரி புதிய 10 MCQ Quiz Poll (Mixed Syllabus — Tamil / English / Tanglish) தொடங்குகிறது!",
         )
+        sent_items: list[dict] = []
         for idx, q in enumerate(questions, start=1):
-            _send_telegram_quiz_poll(target_chat, idx, q)
+            ok = _send_telegram_quiz_poll(target_chat, idx, q)
+            if ok:
+                sent_items.append(q)
             time.sleep(2)
 
-
-def _ist_now() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5, minutes=30)
+        if sent_items:
+            _save_sent_questions(sent_items)
 
 
 def _morning_quiz_loop():
@@ -468,37 +691,50 @@ _start_morning_quiz_thread()
 
 
 @app.route("/", methods=["GET"])
+@app.route("/health", methods=["GET"])
 def home():
     return "Karka AI Bot is running!", 200
+
+
+@app.route("/run-daily-quiz", methods=["GET", "POST"])
+def trigger_daily_quiz():
+    if CRON_SECRET:
+        provided = request.headers.get("X-Cron-Secret") or request.args.get("secret", "")
+        if provided != CRON_SECRET:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+    threading.Thread(target=run_daily_morning_quiz_job, daemon=True).start()
+    return jsonify({"ok": True, "status": "quiz_job_started"}), 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True) or {}
-    msg = data.get("message") or data.get("edited_message")
+    msg = data.get("message") or data.get("channel_post") or data.get("edited_message")
     if not msg or not msg.get("text"):
         return "ok", 200
 
     chat_id = msg["chat"]["id"]
     student_q = msg["text"].strip()
 
-    if student_q.lower() == "/setquiz":
-        _save_last_chat_id(chat_id)
+    if student_q.lower().startswith("/setquiz"):
+        parts = student_q.split(maxsplit=1)
+        target_id = parts[1].strip() if len(parts) > 1 and parts[1].strip() else str(chat_id)
+        _save_last_chat_id(target_id)
         send_telegram(
             chat_id,
-            "Karka AI by Pranila Infotech.\n✅ இந்த Chat தினசரி 10 MCQ Quiz Poll-க்கு செட் செய்யப்பட்டது (06:30 AM IST).",
+            f"Karka AI by Pranila Infotech.\n✅ Target Chat/Channel ({target_id}) தினசரி 10 MCQ Quiz Poll-க்கு செட் செய்யப்பட்டது (06:30 AM IST).",
         )
         return "ok", 200
 
-    if student_q.lower() == "/testquiz":
-        send_telegram(chat_id, "Karka AI by Pranila Infotech.\n⏳ Test Quiz Poll அனுப்பப்படுகிறது...")
+    if student_q.lower().startswith("/testquiz"):
+        send_telegram(chat_id, "Karka AI by Pranila Infotech.\n⏳ புதிய Mixed Syllabus Test Quiz Poll அனுப்பப்படுகிறது...")
         threading.Thread(target=run_daily_morning_quiz_job, daemon=True).start()
         return "ok", 200
 
-    if not QUIZ_CHAT_ID:
+    if not QUIZ_CHAT_ID and str(chat_id).startswith("-100"):
         _save_last_chat_id(chat_id)
 
-    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    today_str = _ist_now().strftime("%Y-%m-%d")
 
     greetings = {"hi", "hello", "hey", "vanakkam", "வணக்கம்", "hai", "namaste", "नमस्ते"}
     if student_q.lower() in greetings:
